@@ -1,6 +1,3 @@
-![coverage](https://img.shields.io/badge/coverage-110%25-brightgreen)
-![build](https://img.shields.io/badge/build-extremely%20passing-blue)
-
 # The IntercalScript Programming Language
 
 IntercalScript is a systems programming language for the web that combines a simple and consistent syntax with a static type system that completely eliminates runtime type errors.
@@ -31,10 +28,6 @@ $ node --experimental-modules hello.mjs
 (node:10834) ExperimentalWarning: The ESM module loader is experimental.
 Hello, world!
 ```
-
-## Windows
-
-Get a better OS, then see above.
 
 # A Quick Tour of IntercalScript
 
@@ -693,63 +686,3 @@ string-set-has(fake-set2, "Hello");
 
 Phantom fields can only be referenced from within dead code, meaning that they do not exist at runtime and that it is impossible for safe code to create a value with phantom fields. This means that if a wrapper function requires an input with a phantom field, we know that it must have come from our own code (or other unsafe code using the same phantom field). In the above example, we use the phantom field `@string-set` to ensure that `string-set-has` can only be called with values produced by `new-string-set`.
 
-# Code formatting
-
-IntercalScript's syntax is enormously flexible. You can include any amount and type of whitespace you wish between any two tokens, you can include or omit trailing semicolons, etc. In order to prevent programmers from making use of this freedom, IntercalScript comes with the code formatting tool `icsfmt`.
-
-`icsfmt` allows you to stop wasting time arguing with your coworkers over trivial style differences and instead bond over your shared hatred of the style imposed by `icsfmt`.
-
-`icsfmt` deliberately has no configuration options. Everybody has their own preferred coding style, but the benefits of a standardized coding style outweigh any minor inconvenience caused by deviations from the preferred style of any particular programmer. We realize that some of the formatting decisions made by `icsfmt` may prove controversial, but we believe that once you try it, you will quickly get used to it and learn to love the benefits of automatic code formatting. Below, you can see a sample of real world code formatted with `icsfmt`.
-
-```
-# import { PairSet } from "util" # import { FILTER , CF_EMPTY , CF_ALL } from
-"filter" # import { GarbageCollector , GCable , LIVE , new-id } from "gc" refcb
-= funct ( n ) n . ref ( ) end ; _idcb = funct ( n ) n . _id end ; let TypeSet
-future = funct ( s ) { s : new-set-mut ( s ) , copy : funct this ( ) TypeSet (
-map ( this . s , refcb ) ) end , deepCopy : funct this ( copies ) TypeSet ( map
-( this . s , funct ( n ) copies . _getCopy ( n ) . ref ( ) end ) ) end , drop :
-funct this ( droplist ) droplist . extend ( this . s ) end , debug : funct this
-( ) map ( this . s , _idcb ) end , (* borrowed other *) merge : funct this (
-other ) changed = false ; do for n in other . iter ( ) then if ! this . s . has
-( n ) then this . s . add ( n . ref ( ) ) ; changed = true end end ; changed end
-```
-
-#  Frequently Asked Questions (FAQ)
-
-### Is this real?
-
-IntercalScript is a real, usable  programming language that has been in development for almost three years. In fact, the IntercalScript compiler is itself written in IntercalScript. You can browse its source [on Github](src/build2.ics).
-
-### Why does IntercalScript not have feature X?
-
-Every language contains novel features and omits someone's favorite feature. IntercalScript was designed with an eye on felicity of programming, speed of compilation, orthogonality of concepts, and the need to support features such as Javascript interoperability. Your favorite feature may be missing because it doesn't fit, because it affects compilation speed or clarity of design, or because it would make the fundamental system model too difficult.
-
-If it bothers you that IntercalScript is missing feature X, please forgive us and investigate the features that IntercalScript does have. You might find that they compensate in interesting ways for the lack of X.
-
-### Why does IntercalScript not have feature Y?
-
-Feature Y may well be added at some point. We don't feel an urgency for it, although we understand some programmers do. Feature Y is undoubtably convenient but it comes at a cost in complexity of the language. We haven't yet found a design for feature Y that does not have any drawbacks and does not compromise IntercalScript's core commitment to simplicity and a lack of features, although we continue to think about it. In the meantime, you are welcome to file an experience report to inform discussion about potential future designs for feature Y.
-
-### Why does IntercalScript not have feature Z?
-
-Feature Z is bad and you should feel bad for proposing it. We consider IntercalScript's lack of feature Z to itself be a feature.
-
-### Where can I learn more about IntercalScript's innovative type inference engine?
-
-For a quick overview of the concepts behind IntercalScript's type system, we recomend reading [this 157 page PHD thesis](https://www.cs.tufts.edu/~nr/cs257/archive/stephen-dolan/thesis.pdf). After that, you can learn more about the particular implementation details of IntercalScript by reading the source code [here](src/types6.ics) and [here](src/typeck6.ics).
-
-### How is `ImmutableTreeListᐸElementTᐳ` a valid identifier? I thought angle brackets weren't allowed.
-
-Look closely. Those aren't angle brackets.
-
-### How do I use template literals in inline Javascript?
-
-You don't.
-
-### Which license does IntercalScript use?
-
-IntercalScript is available under an idiosyncratic non-FSF approved license which is identical to the MIT license except for the addition of the line `The Software shall be used for Good, not Douglas Crockford.`
-
-### Help! Whenever I use the undocumented keyword "please" more than three times in a file, I get a mysterious compile error and I can't figure out why.
-
-If you figure out where the error is coming from, please tell us.
