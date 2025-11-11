@@ -1,0 +1,216 @@
+# `typeck6.ics` 类型检查模块详解
+
+`typeck6.ics` 结合语法树遍历、约束求解与类型方案管理，实现 IntercalScript 的第六代静态类型检查器。模块分为三层：`Scope` 保存作用域级别元信息，`Bindings` 负责具体类型推断与环境变换，顶层 `getType` 驱动整个编译单元的检查过程。下文按照源代码顺序，详细解释每个函数及其内部逻辑。
+
+## Scope 构造体
+
+- `Scope future(consts, parent)`：构建作用域快照。函数体先从 `consts` 中解构出模块修饰符与求解器引用，并返回一个对象：
+  - `consts`, `mods`, `solver` 保留调用方传入的上下文。
+  - `localcells` 初始化为空列表，用于回收当前作用域创建的临时类型节点。
+  - `parent-bindings` 保存父级 `Bindings`，为变量向外查询做准备。
+  - `factory` 如果没有父作用域则新建 `Factory(MONO, null)` 作为根工厂，否则沿用父作用域的工厂，确保变量的多态共享状态正确。
+  - `nonlocals` 与 `assignments` 分别创建可变 Map，记录“先读后写”情况。
+  - `childScope` 是闭包函数 `funct this (bindings) Scope(this.consts, bindings) end`，将当前 `consts` 与即将成为父级的 `bindings` 传给 `Scope`，用于在 `getFuncType` 等地方构建子作用域。
+  - `isExported` 返回布尔值，内部调用 `!s.startsWith(name, "_")`，实现“下划线前缀私有”的导出检测。
+
+## Bindings 环境
+
+`Bindings future(scope, bindings, final, context, factory)` 返回一个封装类型环境的对象，所有方法共享 `this`：
+
+- 构造函数：若传入 `context == null`，构造 `{fut: null, unsafe: false, dead: false}` 并复制进入对象字段。`factory` 允许被替换，以便临时创建多态上下文。
+- `internalError()`：直接调用 `this.s.consts.reporter.internalError()`，用于在逻辑不可能发生的情况下中止检查。
+- `reportError(msg)` 和 `reportWarning(msg)`：分别委托 reporter 的 `onError` 与 `onWarning`。所有错误路径复用这两个入口。
+- `getLitType(name)`：
+  - 首先检查本地 `bindings` 是否已有变量定义。若存在表示这是普通变量，返回 `null`。
+  - 否则向上递归父绑定：`parent = this.s.parent-bindings`，如果存在则调用 `parent.getLitType(name)`。递归到最顶层仍找不到时转而调用 `get-literal-type(name)`，让字面量表回答该名字是否为预定义字面量。
+- `getVarRC(name, span, islocal, child-scope)`：
+  - 若 `islocal` 为假，表示子作用域正在读取当前作用域的变量，需要把该变量标记为 final：`this.final.set(name, span)`。
+  - 查当前 `bindings`，若存在则返回克隆 `rc.clone()`。
+  - 若当前找不到：将变量加入 `this.s.nonlocals`，记录第一次读取位置；如果有父绑定则递归 `parent.getVarRC(...)`。
+  - 如果递归到最顶层仍未找到：
+    - 查询字面量表 `lit = get-literal-type(name)`。如果也为 `null`，报告“Undefined variable”，同时创建 `dummy` 多态方案防止重复报错，并把这个占位方案放入 `child-scope.bindings`。
+    - 如果找到了字面量，根据类型构造新的 `Factory(Universe(), null)`，在其中创建对应的原型节点 `PUndef/PNull/PBool/PInt/PNum`，锁定 `factory.uni` 防止后续改动，并返回新的 `Scheme`。
+- `dummyScheme()`：基于当前 `factory` 创建 `Bot` 节点并包装成 `Scheme`，用于错误回退。实现为 `Scheme(this.factory.uni, this.factory.Bot(), 0)`。
+- `dummySchemePoly()`：
+  - 创建临时工厂 `Factory(Universe(), null)`，生成 `Bot` 节点的方案，随后锁定该工厂的 universe，确保不会被赋予额外多态信息。
+  - 返回该方案供调用者克隆。
+- `getVar(name, expl)`：
+  - 通过 `getVarRC` 取到方案，并检查该方案的 `uni` 是否与当前 `factory.uni` 相同。
+  - 若不同且目标 `uni` 未被锁定，说明在未护卫的多态上下文中访问到外部变量，调用 `reportError` 给出错误并返回 `dummyScheme()`。
+  - 若 `uni` 已锁定，则调用 `rc.moveInto(this.factory)` 复制到当前工厂并返回。
+- `dropBinding(name)`：
+  - 查询旧方案 `old`，若存在则调用 `old.drop()` 释放引用，然后从 `bindings` 删除记录。
+- `setVar(name, rc, expl)`：
+  - 先查看 `this.final`：如果存在同名记录表示变量被闭包捕获且必须只读，此时报告错误并留存 note 信息。
+  - 把赋值位置写入 `this.s.assignments`，调用 `dropBinding(name)` 清理旧值，最后设置新方案。
+- `directAssignment(name, name2, span, rhs-span)`：
+  - 当左值与右值名称相同并且当前绑定已有该变量时跳过，其他情况直接调用 `setVar(...)`，但右值方案通过 `getVarRC` 克隆而不是重新推断。
+- `copy()`：
+  - 对当前 `bindings` 的每个方案执行 `rc.clone()`，生成新的可变 Map。
+  - `final` Map 也复制，`context` 与 `factory` 复用，返回新的 `Bindings`，用于 `if` 条件等场景创建分支环境。
+- `solve(t1, t2)`：
+  - 准备 droplist，调用 `this.s.solver.solve(droplist, (t1, t2))` 触发求解。
+  - 把 `t1`/`t2` 加入 droplist，并调用 `finish-droplist`，确保求解过程中创建的临时节点被正确释放。
+- `solveAndDrop(scheme, rhs)`：取方案的主体 `scheme.t` 与 `rhs` 调用 `solve`，随后不再使用 `scheme`，由调用者负责释放。
+- `dropAllBindings()`：
+  - 遍历所有绑定名，逐个 `dropBinding`，用于作用域结束时清空环境。
+- `filterScheme(scheme, filter)`：
+  - 若方案所属 `uni` 等于当前工厂，则直接调用 `this.factory.filter`。否则需要创建新的 `Factory(Universe(), null)` 避免污染原方案。
+  - 返回过滤后的新 `Scheme`。
+- `filterBinding(name, filter)`：
+  - 获取当前绑定方案，如果存在且当前 `factory` 与 `scope.factory` 完全相同，调用 `filterScheme` 并覆盖绑定。
+- `join(other)`：
+  - 遍历当前绑定：对每个变量从 `other` 中取对应方案。
+  - 若 `other` 没有该变量，表示另一分支缺少此绑定，直接调用 `dropBinding` 删除（也会 `drop` old scheme）。
+  - 如果两个方案的主体节点相同（`rc1.t == rc2.t`），说明共享引用，直接 `rc2.drop()` 释放额外副本。
+  - 否则调用 `merge-schemes(this.factory, rc1, rc2)` 创建合并后的方案，并写回 `bindings`。
+  - 处理完当前绑定后，调用 `other.dropAllBindings()` 清空另一分支，并把 `other.final` 中的记录拷贝到当前 `final`。
+- `getPatternBounds(pat, out-bindings)`：
+  - 模式为 `VarPat` 时检查是否重复绑定：若 `out-bindings` 已存在该名字，报“Duplicate assignment”并返回 `Top()` 占位；否则为模式创建一对 `VarPair`，把下界 `p` 和源位置信息存入 `out-bindings`，返回上界 `n`。
+  - 模式为 `ObjPat` 时遍历每个键：
+    - 调用 `_checkPhantom` 确保键合法。
+    - 为每个键维护集合 `bound-map`，把递归得到的边界合集添加进去。
+    - 最后调用 `this.factory.NObj(bound-map, new-map(_), span)` 返回需要满足的对象结构。
+  - 模式为 `CasePat` 时递归计算内部对象的边界，并包装成 `this.factory.NCase(...)`。
+- `doAssignment(lhs-pat, rhs-scheme, final)`：
+  - 先调用 `getPatternBounds` 得到所有变量和它们的类型变量 `type`/`span`。
+  - 对每个绑定将 `rhs-scheme` 的 universe 替换成当前 `type`，写入 `bindings`，并在 `final==true` 时把 span 写入 `this.final`。
+  - 最后调用 `solveAndDrop(rhs-scheme, bound)`，让右侧实际类型满足整体模式约束。
+- `getTypeField(scheme, name, span)`：
+  - 创建新的类型变量对 `(n, p)`。
+  - 调用 `solve(scheme.t, this.factory.NObj(...))`，要求 `scheme.t` 至少具备字段 `name`。
+  - 返回指向字段类型上界的 `Scheme(scheme.uni, p, 0)`。
+- `_solveCondTypeBinop(ast, cond-expl)`：
+  - 对 `&&` 与 `||`：对左表达式调用 `solveCondType`，根据运算符选择哪个分支继续求解右表达式（`&&` 在真分支继续，`||` 在当前环境继续）。
+  - 对 `==` 与 `!=`：若左右都是变量名，则检查右变量是否为 `null` 或 `undefined` 字面量，根据比较运算符交换过滤器，并为左右两个环境分别应用 `FILTER.NULL`/`FILTER.NOTNULL` 等过滤。过滤后返回新的真分支环境，否则返回 `null` 表示无需特殊处理。
+  - 其他二元运算忽略，返回 `null`。
+- `_solveCondTypeAssign(tag, ast)`：
+  - 提前求解右值 `rhs`，避免拆分环境前遗漏副作用。
+  - 复制当前环境作为真分支，设置 `falseb = this` 作为假分支。
+  - 若右值是变量名，根据条件过滤分别更新两个环境中的绑定。
+  - 对真分支把右值方案套用 `filterScheme` 后执行 `doAssignment(lhs, rhs, false)`，最后返回真分支。
+- `_solveCondTypeField(tuple-expr, name, cond-expl)`：
+  - 针对对象字面量条件：如果字段 `name` 正好出现在字面量末尾，则循环遍历所有键：
+    - 对匹配键调用 `solveCondType(expr, cond-expl)` 并返回结果；
+    - 对不匹配键直接推断类型后 drop。
+  - 否则返回 `null`。
+- `solveCondType(ast, cond-expl)`：
+  - 若当前上下文没有正在进行的 `future`（`context.fut == null`），根据 AST 类型分派到上述三个私有函数。
+  - 如果得到 `return` 环境，则直接返回。
+  - 否则正常求类型：调用 `getType(ast)`，对结果与 `NBool(cond-expl)` 执行求解（确保条件表达式可布尔化），最终返回 `this.copy()`，保持真假分支环境一致。
+- `_getTypeSemi(ast)`：
+  - 采用手动栈遍历连锁的 `Semi` 节点，将左侧链条放入栈中循环求类型并 drop 结果。
+  ￼- 最后对最右表达式调用 `getType` 并返回该方案。
+- `_getTypeUnsafe(ast)`：
+  - 保存当前 `context.unsafe`，设置为 `true`，让内部表达式可以访问危险操作。
+  - `getType(expr)` 求出类型后恢复旧值并返回。
+- `_getTypeBinop(ast)`：
+  - 对短路逻辑与或：利用 `solveCondType` 处理左右分支，合并环境后强制结果为布尔类型。
+  - 对普通算术与比较：先对左右求类型，通过 `s.includes` 判断运算符类别。
+    - 对严格比较（`==`/`!=`）直接 drop，结果为 `PBool`。
+    - 对数值比较（`< <= > >=`）调用 `solveAndDrop` 要求两侧为数字。
+    - 位运算针对整数，浮点运算针对 `NNum`，字符串拼接 `+'` 要求左为字符串右为字符串或数字，字符串比较运算要求两侧都是字符串。
+  - 最终返回包装好的 `Scheme(this.factory.uni, t, 0)`。
+- `_getTypeFuture(ast)`：
+  - 在检查多态上下文 `_checkPoly("assignments", span)` 通过后，先调用 `this.factory.VarPair()` 构造占位变量 `n/p`，把 `rhs-placeholder` 绑定到 `lhs` 上并标记 final。
+  - 设置 `context.fut = span`，调用 `getType(rhs)`，结束后恢复旧值。
+  - 使用 `solveAndDrop(e, n)` 把右值约束到占位变量上，最后返回 `PBool(span)`。
+- `_getTypeAssign(ast)`：
+  - 当 `poly-span` 不为空时，调用 `_checkPragma("rank1-types", ...)` 强制要求 pragma。
+  - 对 `_checkPoly("assignments", span)` 失败的场景直接返回 `PBool` 占位。
+  - 若左值是变量：
+    - 如果存在 `poly-span`，将当前 `factory` 暂存为 `old`，创建新的 `Factory(Universe(), poly-span)`，在新工厂推断右值，锁定新工厂后检查 `poly-count` 是否满足 `poly` 期望。
+    - 若 `context.fut == null` 且右值是简单变量引用，则调用 `directAssignment`，否则 `setVar` 为新方案。
+  - 非变量模式则调用 `doAssignment(lhs, getType(rhs), false)`。
+  - 无论哪种情况都返回 `PBool(span)`，因为赋值表达式在语言里返回布尔。
+- `processImport(ast)`：
+  - 对 `extern` 导入：创建 `dummy-scheme`，并设置 `get-export` 回调为复制 dummy。
+  - 对普通导入：调用 `this.s.mods.src-path.resolve(path, span)` 找到模块，读取 `exports` Map，并将 `get-export` 改为从其中取值。
+  - 遍历左值列表 `{key, name, span}`：
+    - 未找到导出时报告类型错误。
+    - 找到则 `setVar(name, rc.clone(), kspan)` 注册变量。
+  - 结束时 drop 创建的 dummy，避免泄露引用。
+- `_getTypeCall(ast)`：
+  - 判断 `expr` 是否为 `Field` 调用。如果是，说明是方法调用：
+    - 取出对象方案 `this.getType(expr)`，新建 `args` Map，把 `this` 参数的集合设为 `[e.t.ref()]`，调用 `getTypeField` 获得函数方案。
+  - 非方法调用直接 `getType(expr)`。
+  - 遍历参数列表 `params`，对每个求类型并把节点数组放入 `args` 中，键值为索引字符串。
+  - 创建变量对 `(n, p)`，调用 `this.solve(ret-type, this.factory.NFunc(args, n, span, this.context.unsafe))` 校验调用合法性，返回 `Scheme(this.factory.uni, p, 0)` 代表返回值类型。
+- `_getTypeObj(ast)`：
+  - 初始化 `key-expls`、`reads`、`writes` 三个 Map。
+  - 遍历对象字段：
+    - 使用 `_checkPhantom` 检测字段名。
+    - 对重复键：若之前记录为 `null` 则忽略，否则报错并保留第一处解释。
+    - 对新键：调用 `this.getType(expr)` 获取类型；根据 `mutable` 字段决定：
+      - 若不可变，将类型添加到 `reads`。
+      - 若可变且 `_checkPoly("mutable objects", span)` 未报错，创建新的 `VarPair`，把写集合 `writes` 指向可写变量 `n`，读集合包含当前表达式类型与变量上界 `p`，以实现读写联动。
+      - 如果 `_checkPoly` 报错，则以 `Top()` 占位，避免进一步错误。
+  - 最后调用 `this.factory.PObj(reads, writes, obj-span)` 构造对象方案。
+- `_getTypeIf(ast)`：
+  - 判断条件是否是字面量 `true`，若是则将 `cond-is-true` 设为 true 以标记 else 分支死代码。
+  - 调用 `solveCondType` 获得 then 分支的环境，计算 then 表达式类型 `e2`。
+  - 暂存 `context.dead`，如果条件恒真则把 dead 标记传给 then 分支；处理 else 分支时若不存在则生成 `PUndef` 占位。
+  - 恢复 `context.dead`，把 then 环境合并回当前环境 `this.join(env2)`，最后调用 `merge-schemes` 合并 then/else 的返回方案。
+- `_getTypeList(ast)`：
+  - 创建变量对 `(n, p)` 作为元素类型。
+  - 遍历列表项：对每个求类型，如果为展开项（`spread == true`）则改为调用 `getTypeField(expr, "@iterable", span)`，最终把所有元素类型统一要求为 `n`。
+  - 调用 `n.drop(this.factory.gc)` 释放下界。
+  - 构造对象属性 Map：包含 `@iterable` 指向 `[p]`，`length` 指向整型。
+  - 返回 `this.factory.PObj(attrs, new-map(_), span)`，即数组视为具备特定字段的对象。
+- `_checkFuture(label, span)`：
+  - 当 `context.fut` 非空时报告错误：前一行提示非法操作，下一行附上 `future` 起点的 span。
+  - 返回布尔值指示是否处于 future 赋值内，调用方可根据该值决定后续操作是否继续。
+- `_getPolyErrorMessage()`：
+  - 如果 `this.factory.expl` 存在，返回换行加上定位提示，否则返回空字符串，帮助 `_checkPoly` 拼接错误信息。
+- `_checkPoly(label, span)`：
+  - 当 `this.factory.uni != this.s.factory.uni`（说明身处未护卫多态上下文）时，调用 `reportError` 给出详细信息，并附带 `_getPolyErrorMessage`。
+  - 返回布尔结果，调用者可利用它决定是否继续执行主逻辑。
+- `_checkPragma(pragma, label, span)`：
+  - 若 `pragmas` 集合未包含指定 pragma，报错并把 pragma 加入集合，避免同一语句重复报错。
+  - 返回布尔值表示是否触发错误。
+- `_checkPhantom(name, span)`：
+  - 当当前控制流不是死代码且字段名包含 `@`，报错：phantom 字段只能在死代码中使用。
+- `getType(ast)`：调用 `_getType(ast)` 并返回结果，日志打印被注释掉，是为调试预留。
+- `_getType(ast)`：
+  - 对每种 AST 节点执行专门逻辑：
+    - `Varb`：若 `_checkFuture` 返回真则取 `dummyScheme()`；否则使用 `getVar`。
+    - `String`：返回 `PStr`。
+    - `JS`：检查 `foreign-function-interface` pragma，否则返回 `dummyScheme()` 表示结果未知。
+    - `Semi`：委托 `_getTypeSemi`。
+    - `Not`：对被取反表达式求类型并要求为 bool。
+    - `Unsafe`/`Binop`/`Future`/`Assign`/`Field`/`SetField`/`Call`/`Obj`/`Case`/`If`/`Funct`/`List`/`While`/`For`：分别调用前面定义的专用方法。
+  - 所有分支处理完成后返回一个 `Scheme`。
+- `doLoop(ast, body)`：
+  - 对 `For` 循环先求 range 表达式的 `@iterable` 字段类型，用于绑定迭代变量。
+  - 将当前 `bindings` 遍历，遇到未被标记 final 的变量，为每个生成 `VarPair`，把上界写回绑定，把原方案移动到 `loopvars`，用于循环结束后收敛。
+  - 对 `For`：复制环境，对循环变量执行 `doAssignment`。
+  - 对 `While`：调用 `solveCondType` 计算条件对环境的影响。
+  - 在子环境执行 `body`，结果丢弃。
+  - 循环结束后对每个临时变量：取出子环境中的方案，删除绑定，并把 `rc` 与之前记录的上界 `bound` 通过 `solveAndDrop` 合并。
+  - 清空子环境所有绑定，并将其中 `final` 信息合并回父作用域。
+- `checkAssignments()`：
+  - 遍历 `nonlocals`，对每个名称查询 `assignments`。一旦发现对应的写位置，报告“变量先读后写”的错误，并附带两个 span。
+- `finishScope(ast)`：
+  - 调用 `checkAssignments` 后 `dropAllBindings`，最后把作用域内所有赋值过的变量名集合加入 `defsmap`，供后续阶段使用。
+- `getFuncType(ast)`：
+  - 为函数体创建新作用域 `scope = this.s.childScope(this)`。
+  - 构造新的 `Bindings`，上下文继承当前 `context` 的 `dead` 和 `unsafe` 标记（若函数声明 `unsafe` 则直接设置）。
+  - 通过 `add-param` 内部函数，把 `this` 参数和普通参数依次映射到新的 `VarPair`，将下界绑定到函数体环境。
+  - 对函数体表达式调用 `env.getType(expr)`，把返回类型加入 `ret-typeset`。
+  - 调用 `env.finishScope(ast)` 清理函数体环境。
+  - 使用 `this.factory.PFunc(param-typesets, ret-typeset, funct-span, unsafe)` 构造函数方案，返回给调用者。
+
+## 顶层辅助函数
+
+- `getUniverse()`：模块级私有变量 `universe = Universe()` 存储共享 `Universe`。`getUniverse` 简单返回该单例，确保所有类型检查步骤共用同一 GC 环境。
+- `getType(mods, src-path, ast, reporter, prelude)`：
+  - 解构模块 AST `Mod`，将 pragma 集合转换为可变集合。
+  - 准备 `defsmap`、`solver` 和 `consts`，其中 `mods: {src-path}` 用于 import 解析。
+  - 如果提供 `prelude`，先创建 `prelude-scope`，把预导出绑定复制到新的 `Bindings`，作为后续作用域的父绑定。
+  - 构建根作用域 `scope = Scope(consts, bindings)` 和根环境 `env = Bindings(scope, new-map-mut(_), new-map-mut(_), null, scope.factory)`。
+  - 逐个处理 import 节点，调用 `env.processImport` 将外部符号注入环境。
+  - 对模块主体表达式 `mod-expr` 求类型并 drop，表示模块顶层表达式不需要类型值。
+  - 遍历环境中的剩余绑定：通过 `scope.isExported(name)` 判断是否导出，若导出则把方案移动到 `exports`。
+  - 调用 `env.finishScope(ast)` 清理作用域，并返回 `{exports, defsmap, nonlocals}`，供编译后续阶段使用。
+
+整体流程通过上述函数协同，完成从作用域构建、变量捕获、控制流类型收敛到最终导出类型表的全过程。每个方法都在出现分支、循环或多态上下文时显式处理环境复制与约束求解，确保类型信息在复杂控制流下仍保持一致。
